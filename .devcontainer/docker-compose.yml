@@ -1,0 +1,31 @@
+version: '3'
+services:
+  ros2-service:
+    # build:
+    #   context: .  # 当前目录为上下文
+    #   dockerfile: ./Dockerfile
+    image: yutou/ros2_driver:latest  # 替换为你的镜像名
+    container_name: AI-container
+
+    environment:
+      - DISPLAY=${DISPLAY}  # GUI 支持
+      - NVIDIA_VISIBLE_DEVICES=all  # 所有 GPU 可见
+      - NVIDIA_DRIVER_CAPABILITIES=all  # 所有驱动能力
+      - OMP_WAIT_POLICY=passive  # 降低 CPU 占用
+      - TERM=xterm-256color  # 彩色终端支持
+
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix  # X11 显示
+      - ./..:/home/yutou/ros2_ws  # 映射工作空间
+      - /var/run/docker.sock:/var/run/docker.sock  # docker-in-docker
+      - /dev:/dev  # 设备挂载（串口、USB、摄像头等）
+
+    network_mode: host  # 主机网络（适合 ROS 发现、camera、IMU）
+    pid: "host"         # PID 共享（有调试需求时用）
+    ipc: "host"         # 共享 IPC（显存等共享需求）
+    privileged: true    # 设备访问权限
+
+    stdin_open: true
+    tty: true
+    user: "yutou"  # 替换为镜像内用户
+    working_dir: "/home/yutou/ros2_ws"  # 替换为对应路径
