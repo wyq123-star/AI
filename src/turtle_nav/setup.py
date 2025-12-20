@@ -34,6 +34,7 @@ setup(
             'turtle_tf = turtle_nav.turtle_tf_node:main',
             'turtle_static_map = turtle_nav.turtle_static_map_node:main',
             'turtle_astar_planner = turtle_nav.turtle_astar_planner:main',
+            'turtle_path_follower = turtle_nav.turtle_path_follower:main',
         ],
     },
 )

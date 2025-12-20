@@ -4,14 +4,18 @@ from rclpy.node import Node
 import numpy as np
 
 from nav_msgs.msg import OccupancyGrid
-from std_msgs.msg import Header
 
 RESOLUTION = 0.1
-MAP_SIZE = int(11.0 / RESOLUTION)
+WORLD_SIZE = 11.0
+MAP_SIZE = int(WORLD_SIZE / RESOLUTION)
 
 
 def world_to_map(x, y):
-    return int(x / RESOLUTION), int(y / RESOLUTION)
+    mx = int(x / RESOLUTION)
+    my = int(y / RESOLUTION)
+    mx = np.clip(mx, 0, MAP_SIZE - 1)
+    my = np.clip(my, 0, MAP_SIZE - 1)
+    return mx, my
 
 
 class TurtleStaticMap(Node):
@@ -25,6 +29,7 @@ class TurtleStaticMap(Node):
             1
         )
 
+        # costmap[y, x]
         self.costmap = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int8)
         self.init_map()
 
@@ -41,19 +46,18 @@ class TurtleStaticMap(Node):
         # 中间墙
         x1, y1 = world_to_map(3.0, 5.0)
         x2, y2 = world_to_map(8.0, 5.5)
-        self.costmap[x1:x2, y1:y2] = 100
+        self.costmap[y1:y2, x1:x2] = 100
 
         # 圆形障碍
         cx, cy = world_to_map(6.0, 2.5)
         r = int(0.5 / RESOLUTION)
-        for i in range(MAP_SIZE):
-            for j in range(MAP_SIZE):
-                if (i-cx)**2 + (j-cy)**2 <= r*r:
-                    self.costmap[i, j] = 100
+        for y in range(MAP_SIZE):
+            for x in range(MAP_SIZE):
+                if (x - cx)**2 + (y - cy)**2 <= r*r:
+                    self.costmap[y, x] = 100
 
     def publish_map(self):
         msg = OccupancyGrid()
-        msg.header = Header()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
 
@@ -64,8 +68,7 @@ class TurtleStaticMap(Node):
         msg.info.origin.position.y = 0.0
         msg.info.origin.orientation.w = 1.0
 
-        # 注意行列顺序
-        msg.data = self.costmap.T.flatten().tolist()
+        msg.data = self.costmap.flatten().tolist()
         self.map_pub.publish(msg)
 
 

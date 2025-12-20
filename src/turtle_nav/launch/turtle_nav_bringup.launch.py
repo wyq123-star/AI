@@ -1,4 +1,7 @@
 from launch import LaunchDescription
+from launch.actions import RegisterEventHandler, IncludeLaunchDescription
+from launch.event_handlers import OnProcessStart
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 import os
 
@@ -10,7 +13,7 @@ def generate_launch_description():
     ld = LaunchDescription()
 
     # =========================
-    # 1. turtlesim 本体
+    # turtlesim
     # =========================
     turtlesim_node = Node(
         package='turtlesim',
@@ -20,17 +23,7 @@ def generate_launch_description():
     )
 
     # =========================
-    # 2. 静态地图节点
-    # =========================
-    static_map_node = Node(
-        package='turtle_nav',
-        executable='turtle_static_map',
-        name='turtle_static_map',
-        output='screen'
-    )
-
-    # =========================
-    # 3. TF + odom 适配节点
+    # TF
     # =========================
     turtle_tf_node = Node(
         package='turtle_nav',
@@ -40,33 +33,69 @@ def generate_launch_description():
     )
 
     # =========================
-    # 4. RViz2 节点
+    # A*
     # =========================
-    rviz_config = os.path.join(
-        get_package_share_directory('turtle_nav'),
-        'rviz',
-        'turtle_nav.rviz'
-    )
-
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        output='screen',
-        arguments=['-d', rviz_config]
-    )
-
     astar_node = Node(
         package='turtle_nav',
         executable='turtle_astar_planner',
-        name='turtle_astar_planner',
+        parameters=[{
+            'use_inflation': True,
+            'use_costmap': True,
+            'inflation_radius': 0.25,
+            'cost_scaling': 8.0
+        }]
+    )
+
+
+    # =========================
+    # follower
+    # =========================
+    follower_node = Node(
+        package='turtle_nav',
+        executable='turtle_path_follower',
+        name='turtle_path_follower',
         output='screen'
     )
 
-    ld.add_action(astar_node)
-    ld.add_action(turtlesim_node)
-    ld.add_action(static_map_node)
-    ld.add_action(turtle_tf_node)
-    ld.add_action(rviz_node)
+    # =========================
+    # map_server launch
+    # =========================
+    map_server_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                get_package_share_directory('turtle_nav'),
+                'launch',
+                'map_server.launch.py'
+            )
+        )
+    )
 
+    # =========================
+    # 启动顺序控制
+    # =========================
+
+    # # A* 启动 → 启动 map_server
+    # start_map_after_astar = RegisterEventHandler(
+    #     OnProcessStart(
+    #         target_action=astar_node,
+    #         on_start=[map_server_launch]
+    #     )
+    # )
+
+    # # map_server 启动 → 启动 follower
+    # start_follower_after_map = RegisterEventHandler(
+    #     OnProcessStart(
+    #         target_action=map_server_launch,
+    #         on_start=[follower_node]
+    #     )
+    # )
+
+    # =========================
+    # 添加到 LaunchDescription
+    # =========================
+    ld.add_action(turtlesim_node)
+    ld.add_action(turtle_tf_node)
+    ld.add_action(astar_node)
+    # ld.add_action(map_server_launch)
+    ld.add_action(follower_node)
     return ld
