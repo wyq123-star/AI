@@ -10,6 +10,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 import heapq
 import math
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 
 class AStarPlanner(Node):
@@ -21,13 +22,11 @@ class AStarPlanner(Node):
         # Parameters
         # =========================
         self.declare_parameter('use_inflation', True)
-        self.declare_parameter('use_costmap', True)
         self.declare_parameter('inflation_radius', 0.2)
         self.declare_parameter('cost_scaling', 10.0)
         self.declare_parameter('allow_unknown', False)
 
         self.use_inflation = self.get_parameter('use_inflation').value
-        self.use_costmap = self.get_parameter('use_costmap').value
         self.inflation_radius = self.get_parameter('inflation_radius').value
         self.cost_scaling = self.get_parameter('cost_scaling').value
         self.allow_unknown = self.get_parameter('allow_unknown').value
@@ -61,7 +60,13 @@ class AStarPlanner(Node):
         self.width = None
         self.height = None
 
-        self.pending_goal = None   # ⭐ 核心：缓存 goal
+        self.pending_goal = None
+        self.costmap_ready = False
+
+        # =========================
+        # Timer for async planning (Nav2 style)
+        # =========================
+        self.timer = self.create_timer(0.1, self.try_plan)  # 10Hz
 
         self.get_logger().info('Nav2-style A* global planner started')
 
@@ -76,39 +81,30 @@ class AStarPlanner(Node):
 
         raw_map = np.array(msg.data, dtype=np.int8).reshape(
             (self.height, self.width))
-
         self.map = raw_map.copy()
 
+        # ====================
+        # 构建快速 costmap
+        # ====================
         if self.use_inflation:
-            self.inflate_obstacles()
-
-        if self.use_costmap:
             self.build_costmap()
-
-        self.get_logger().info('Costmap built')
-
-        # ⭐ 地图 ready 后，尝试规划
-        self.try_plan()
+            self.costmap_ready = True
+            self.get_logger().info('Costmap built')
 
     # =====================================================
-    # Goal callback（只缓存，不做判断）
+    # Goal callback（缓存 goal）
     # =====================================================
     def goal_callback(self, goal: PoseStamped):
         self.pending_goal = goal
         self.get_logger().info(
-            f'Goal cached: x={goal.pose.position.x:.2f}, '
-            f'y={goal.pose.position.y:.2f}'
+            f'Goal cached: x={goal.pose.position.x:.2f}, y={goal.pose.position.y:.2f}'
         )
-        self.try_plan()
 
     # =====================================================
-    # Try planning (Nav2-style gating)
+    # Timer: try planning
     # =====================================================
     def try_plan(self):
-        if self.pending_goal is None:
-            return
-
-        if self.map is None:
+        if self.pending_goal is None or self.map is None:
             return
 
         start = self.get_robot_pose()
@@ -116,24 +112,16 @@ class AStarPlanner(Node):
             return
 
         goal = self.pending_goal
-        self.pending_goal = None
-
-        self.get_logger().info(
-            f'Received goal: x={goal.pose.position.x:.2f}, '
-            f'y={goal.pose.position.y:.2f}'
-        )
+        self.pending_goal = None  # 防止重复规划
 
         start_idx = self.world_to_grid(start.x, start.y)
-        goal_idx = self.world_to_grid(
-            goal.pose.position.x, goal.pose.position.y)
+        goal_idx = self.world_to_grid(goal.pose.position.x, goal.pose.position.y)
 
-        if not self.is_free(start_idx) or not self.is_free(goal_idx):
-            self.get_logger().warn('Start or goal in obstacle')
-            return
-
-        path = self.astar(start_idx, goal_idx)
+        # costmap 未就绪时用空 costmap（保证可以先规划）
+        path = self.astar(start_idx, goal_idx, self.costmap if self.costmap_ready else None)
         if path:
             self.publish_path(path)
+            self.get_logger().info(f'Path published with {len(path)} points')
 
     # =====================================================
     # TF
@@ -149,22 +137,19 @@ class AStarPlanner(Node):
     # =====================================================
     # A*
     # =====================================================
-    def astar(self, start, goal):
+    def astar(self, start, goal, costmap=None):
         open_set = []
         heapq.heappush(open_set, (0.0, start))
-
         came_from = {}
         g_score = {start: 0.0}
 
         while open_set:
             _, current = heapq.heappop(open_set)
-
             if current == goal:
                 return self.reconstruct_path(came_from, current)
 
             for n in self.neighbors(current):
-                tentative = g_score[current] + self.cost(n)
-
+                tentative = g_score[current] + self.cost(n, costmap)
                 if n not in g_score or tentative < g_score[n]:
                     came_from[n] = current
                     g_score[n] = tentative
@@ -199,45 +184,21 @@ class AStarPlanner(Node):
             return self.allow_unknown
         return False
 
-    def cost(self, idx):
-        if self.costmap is None:
+    def cost(self, idx, costmap=None):
+        if costmap is None:
             return 1.0
-        return 1.0 + self.costmap[idx[1], idx[0]]
+        return 1.0 + costmap[idx[1], idx[0]]
 
     # =====================================================
-    # Inflation
-    # =====================================================
-    def inflate_obstacles(self):
-        radius_cells = int(self.inflation_radius / self.resolution)
-        inflated = self.map.copy()
-
-        for y in range(self.height):
-            for x in range(self.width):
-                if self.map[y, x] == 100:
-                    for dy in range(-radius_cells, radius_cells + 1):
-                        for dx in range(-radius_cells, radius_cells + 1):
-                            nx, ny = x + dx, y + dy
-                            if 0 <= nx < self.width and 0 <= ny < self.height:
-                                inflated[ny, nx] = 100
-
-        self.map = inflated
-
-    # =====================================================
-    # Costmap
+    # Fast costmap using distance transform
     # =====================================================
     def build_costmap(self):
-        self.costmap = np.zeros((self.height, self.width), dtype=np.float32)
-        obstacle_cells = np.argwhere(self.map == 100)
-
-        for y in range(self.height):
-            for x in range(self.width):
-                min_dist = float('inf')
-                for oy, ox in obstacle_cells:
-                    d = math.hypot(x - ox, y - oy)
-                    min_dist = min(min_dist, d)
-                if min_dist < float('inf'):
-                    self.costmap[y, x] = math.exp(
-                        -min_dist / self.cost_scaling)
+        obstacle_mask = (self.map == 100)
+        if self.use_inflation:
+            dist = distance_transform_edt(~obstacle_mask) * self.resolution
+            self.costmap = np.exp(-dist / self.cost_scaling)
+        else:
+            self.costmap = np.zeros_like(self.map, dtype=np.float32)
 
     # =====================================================
     # Utils
@@ -268,8 +229,7 @@ class AStarPlanner(Node):
         for gx, gy in grid_path:
             pose = PoseStamped()
             pose.header.frame_id = 'map'
-            pose.pose.position.x, pose.pose.position.y = \
-                self.grid_to_world(gx, gy)
+            pose.pose.position.x, pose.pose.position.y = self.grid_to_world(gx, gy)
             pose.pose.orientation.w = 1.0
             path.poses.append(pose)
 
