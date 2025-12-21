@@ -33,28 +33,18 @@ class AStarPlanner(Node):
         self.allow_unknown = self.get_parameter('allow_unknown').value
 
         # =========================
-        # QoS (关键修复)
+        # ROS I/O
         # =========================
-        map_qos = QoSProfile(
-            depth=1,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL
-        )
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, '/map', self.map_callback, 10)
 
         goal_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
-
-        # =========================
-        # ROS I/O
-        # =========================
-        self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, map_qos)
-
         self.goal_sub = self.create_subscription(
-            PoseStamped, '/goal_pose', self.goal_callback, 10)
+            PoseStamped, '/goal_pose', self.goal_callback, goal_qos)
 
         self.path_pub = self.create_publisher(Path, '/plan', 10)
 
@@ -62,7 +52,7 @@ class AStarPlanner(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # =========================
-        # Map data
+        # State
         # =========================
         self.map = None
         self.costmap = None
@@ -71,7 +61,9 @@ class AStarPlanner(Node):
         self.width = None
         self.height = None
 
-        self.get_logger().info('A* planner started (shadow-forbidden mode)')
+        self.pending_goal = None   # ⭐ 核心：缓存 goal
+
+        self.get_logger().info('Nav2-style A* global planner started')
 
     # =====================================================
     # Map callback
@@ -82,15 +74,10 @@ class AStarPlanner(Node):
         self.resolution = msg.info.resolution
         self.origin = msg.info.origin.position
 
-        raw = np.array(msg.data, dtype=np.int8).reshape(
+        raw_map = np.array(msg.data, dtype=np.int8).reshape(
             (self.height, self.width))
 
-        # 核心规则：
-        # 100  = obstacle
-        # -1   = unknown（阴影）→ 当作 obstacle
-        # 0    = free
-        self.map = raw.copy()
-        self.map[self.map < 0] = 100   # 🔒 永远禁止进入阴影
+        self.map = raw_map.copy()
 
         if self.use_inflation:
             self.inflate_obstacles()
@@ -98,31 +85,50 @@ class AStarPlanner(Node):
         if self.use_costmap:
             self.build_costmap()
 
-        self.get_logger().info('Map received and processed')
+        self.get_logger().info('Costmap built')
+
+        # ⭐ 地图 ready 后，尝试规划
+        self.try_plan()
 
     # =====================================================
-    # Goal
+    # Goal callback（只缓存，不做判断）
     # =====================================================
     def goal_callback(self, goal: PoseStamped):
+        self.pending_goal = goal
         self.get_logger().info(
-            f'Received goal x={goal.pose.position.x:.2f}, '
+            f'Goal cached: x={goal.pose.position.x:.2f}, '
             f'y={goal.pose.position.y:.2f}'
         )
+        self.try_plan()
+
+    # =====================================================
+    # Try planning (Nav2-style gating)
+    # =====================================================
+    def try_plan(self):
+        if self.pending_goal is None:
+            return
 
         if self.map is None:
-            self.get_logger().warn('No map yet')
             return
 
         start = self.get_robot_pose()
         if start is None:
             return
 
+        goal = self.pending_goal
+        self.pending_goal = None
+
+        self.get_logger().info(
+            f'Received goal: x={goal.pose.position.x:.2f}, '
+            f'y={goal.pose.position.y:.2f}'
+        )
+
         start_idx = self.world_to_grid(start.x, start.y)
         goal_idx = self.world_to_grid(
             goal.pose.position.x, goal.pose.position.y)
 
         if not self.is_free(start_idx) or not self.is_free(goal_idx):
-            self.get_logger().warn('Start or goal in obstacle / shadow')
+            self.get_logger().warn('Start or goal in obstacle')
             return
 
         path = self.astar(start_idx, goal_idx)
@@ -138,7 +144,6 @@ class AStarPlanner(Node):
                 'map', 'base_link', rclpy.time.Time())
             return tf.transform.translation
         except Exception:
-            self.get_logger().warn('TF not ready')
             return None
 
     # =====================================================
@@ -150,20 +155,16 @@ class AStarPlanner(Node):
 
         came_from = {}
         g_score = {start: 0.0}
-        visited = set()
 
         while open_set:
             _, current = heapq.heappop(open_set)
-
-            if current in visited:
-                continue
-            visited.add(current)
 
             if current == goal:
                 return self.reconstruct_path(came_from, current)
 
             for n in self.neighbors(current):
                 tentative = g_score[current] + self.cost(n)
+
                 if n not in g_score or tentative < g_score[n]:
                     came_from[n] = current
                     g_score[n] = tentative
@@ -187,11 +188,16 @@ class AStarPlanner(Node):
         return results
 
     # =====================================================
-    # Collision & cost
+    # Cost & collision
     # =====================================================
     def is_free(self, idx):
         x, y = idx
-        return self.map[y, x] == 0
+        cell = self.map[y, x]
+        if cell == 0:
+            return True
+        if cell == -1:
+            return self.allow_unknown
+        return False
 
     def cost(self, idx):
         if self.costmap is None:
@@ -202,16 +208,17 @@ class AStarPlanner(Node):
     # Inflation
     # =====================================================
     def inflate_obstacles(self):
-        r = int(self.inflation_radius / self.resolution)
+        radius_cells = int(self.inflation_radius / self.resolution)
         inflated = self.map.copy()
 
-        obs = np.argwhere(self.map == 100)
-        for oy, ox in obs:
-            for dy in range(-r, r + 1):
-                for dx in range(-r, r + 1):
-                    ny, nx = oy + dy, ox + dx
-                    if 0 <= nx < self.width and 0 <= ny < self.height:
-                        inflated[ny, nx] = 100
+        for y in range(self.height):
+            for x in range(self.width):
+                if self.map[y, x] == 100:
+                    for dy in range(-radius_cells, radius_cells + 1):
+                        for dx in range(-radius_cells, radius_cells + 1):
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < self.width and 0 <= ny < self.height:
+                                inflated[ny, nx] = 100
 
         self.map = inflated
 
@@ -220,15 +227,17 @@ class AStarPlanner(Node):
     # =====================================================
     def build_costmap(self):
         self.costmap = np.zeros((self.height, self.width), dtype=np.float32)
-        obs = np.argwhere(self.map == 100)
+        obstacle_cells = np.argwhere(self.map == 100)
 
         for y in range(self.height):
             for x in range(self.width):
-                dmin = min(
-                    (math.hypot(x - ox, y - oy) for oy, ox in obs),
-                    default=1e6
-                )
-                self.costmap[y, x] = math.exp(-dmin / self.cost_scaling)
+                min_dist = float('inf')
+                for oy, ox in obstacle_cells:
+                    d = math.hypot(x - ox, y - oy)
+                    min_dist = min(min_dist, d)
+                if min_dist < float('inf'):
+                    self.costmap[y, x] = math.exp(
+                        -min_dist / self.cost_scaling)
 
     # =====================================================
     # Utils
@@ -239,17 +248,17 @@ class AStarPlanner(Node):
         return gx, gy
 
     def grid_to_world(self, gx, gy):
-        return (
-            gx * self.resolution + self.origin.x,
-            gy * self.resolution + self.origin.y
-        )
+        x = gx * self.resolution + self.origin.x
+        y = gy * self.resolution + self.origin.y
+        return x, y
 
     def reconstruct_path(self, came_from, current):
         path = [current]
         while current in came_from:
             current = came_from[current]
             path.append(current)
-        return path[::-1]
+        path.reverse()
+        return path
 
     def publish_path(self, grid_path):
         path = Path()
