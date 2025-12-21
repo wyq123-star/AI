@@ -96,6 +96,6 @@ def generate_launch_description():
     ld.add_action(turtlesim_node)
     ld.add_action(turtle_tf_node)
     ld.add_action(astar_node)
-    # ld.add_action(map_server_launch)
+    ld.add_action(map_server_launch)
     ld.add_action(follower_node)
     return ld
