@@ -22,20 +22,24 @@ class AStarPlanner(Node):
         # Parameters
         # =========================
         self.declare_parameter('use_inflation', True)
-        self.declare_parameter('inflation_radius', 0.2)
-        self.declare_parameter('cost_scaling', 10.0)
+        self.declare_parameter('inflation_radius', 1.0)     # 膨胀影响范围（米）
+        self.declare_parameter('lethal_radius', 0.3)        # 致命半径（米）
+        self.declare_parameter('cost_scaling', 10.0)        # 膨胀代价强度
+        self.declare_parameter('cost_weight', 5.0)          # 代价权重
         self.declare_parameter('allow_unknown', False)
 
         self.use_inflation = self.get_parameter('use_inflation').value
         self.inflation_radius = self.get_parameter('inflation_radius').value
+        self.lethal_radius = self.get_parameter('lethal_radius').value
         self.cost_scaling = self.get_parameter('cost_scaling').value
+        self.cost_weight = self.get_parameter('cost_weight').value
         self.allow_unknown = self.get_parameter('allow_unknown').value
 
         # =========================
         # ROS I/O
         # =========================
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/map', self.map_callback, 10)
+            OccupancyGrid, '/planning_map', self.map_callback, 10)
 
         goal_qos = QoSProfile(
             depth=1,
@@ -64,11 +68,11 @@ class AStarPlanner(Node):
         self.costmap_ready = False
 
         # =========================
-        # Timer for async planning (Nav2 style)
+        # Timer
         # =========================
-        self.timer = self.create_timer(0.1, self.try_plan)  # 10Hz
+        self.timer = self.create_timer(0.1, self.try_plan)
 
-        self.get_logger().info('Nav2-style A* global planner started')
+        self.get_logger().info('A* global planner with inflation started')
 
     # =====================================================
     # Map callback
@@ -83,16 +87,13 @@ class AStarPlanner(Node):
             (self.height, self.width))
         self.map = raw_map.copy()
 
-        # ====================
-        # 构建快速 costmap
-        # ====================
         if self.use_inflation:
             self.build_costmap()
             self.costmap_ready = True
-            self.get_logger().info('Costmap built')
+            self.get_logger().info('Costmap rebuilt')
 
     # =====================================================
-    # Goal callback（缓存 goal）
+    # Goal callback
     # =====================================================
     def goal_callback(self, goal: PoseStamped):
         self.pending_goal = goal
@@ -101,7 +102,7 @@ class AStarPlanner(Node):
         )
 
     # =====================================================
-    # Timer: try planning
+    # Timer planning
     # =====================================================
     def try_plan(self):
         if self.pending_goal is None or self.map is None:
@@ -112,16 +113,16 @@ class AStarPlanner(Node):
             return
 
         goal = self.pending_goal
-        self.pending_goal = None  # 防止重复规划
+        self.pending_goal = None
 
         start_idx = self.world_to_grid(start.x, start.y)
         goal_idx = self.world_to_grid(goal.pose.position.x, goal.pose.position.y)
 
-        # costmap 未就绪时用空 costmap（保证可以先规划）
-        path = self.astar(start_idx, goal_idx, self.costmap if self.costmap_ready else None)
+        path = self.astar(start_idx, goal_idx,
+                          self.costmap if self.costmap_ready else None)
         if path:
             self.publish_path(path)
-            self.get_logger().info(f'Path published with {len(path)} points')
+            self.get_logger().info(f'Path published ({len(path)} points)')
 
     # =====================================================
     # TF
@@ -145,11 +146,13 @@ class AStarPlanner(Node):
 
         while open_set:
             _, current = heapq.heappop(open_set)
+
             if current == goal:
                 return self.reconstruct_path(came_from, current)
 
-            for n in self.neighbors(current):
-                tentative = g_score[current] + self.cost(n, costmap)
+            for n, step_cost in self.neighbors(current):
+                tentative = g_score[current] + step_cost * self.cost(n, costmap)
+
                 if n not in g_score or tentative < g_score[n]:
                     came_from[n] = current
                     g_score[n] = tentative
@@ -160,45 +163,64 @@ class AStarPlanner(Node):
         return None
 
     def heuristic(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+        return math.hypot(a[0] - b[0], a[1] - b[1])
 
     def neighbors(self, idx):
         x, y = idx
         results = []
-        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+
+        for dx, dy in [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1)
+        ]:
             nx, ny = x + dx, y + dy
             if 0 <= nx < self.width and 0 <= ny < self.height:
                 if self.is_free((nx, ny)):
-                    results.append((nx, ny))
+                    step = math.hypot(dx, dy)
+                    results.append(((nx, ny), step))
         return results
 
     # =====================================================
-    # Cost & collision
+    # Collision & cost
     # =====================================================
     def is_free(self, idx):
         x, y = idx
-        cell = self.map[y, x]
-        if cell == 0:
-            return True
-        if cell == -1:
+
+        if self.map[y, x] == 100:
+            return False
+
+        if self.costmap_ready:
+            if not np.isfinite(self.costmap[y, x]):
+                return False
+
+        if self.map[y, x] == -1:
             return self.allow_unknown
-        return False
+
+        return True
 
     def cost(self, idx, costmap=None):
         if costmap is None:
             return 1.0
-        return 1.0 + costmap[idx[1], idx[0]]
+        return 1.0 + self.cost_weight * costmap[idx[1], idx[0]]
 
     # =====================================================
-    # Fast costmap using distance transform
+    # Costmap (Nav2-style inflation)
     # =====================================================
     def build_costmap(self):
         obstacle_mask = (self.map == 100)
-        if self.use_inflation:
-            dist = distance_transform_edt(~obstacle_mask) * self.resolution
-            self.costmap = np.exp(-dist / self.cost_scaling)
-        else:
-            self.costmap = np.zeros_like(self.map, dtype=np.float32)
+
+        dist = distance_transform_edt(~obstacle_mask) * self.resolution
+        self.costmap = np.zeros_like(dist, dtype=np.float32)
+
+        lethal_mask = dist < self.lethal_radius
+        self.costmap[lethal_mask] = np.inf
+
+        inflation_mask = (dist >= self.lethal_radius) & \
+                         (dist <= self.inflation_radius)
+
+        self.costmap[inflation_mask] = self.cost_scaling * np.exp(
+            -(dist[inflation_mask] - self.lethal_radius)
+        )
 
     # =====================================================
     # Utils

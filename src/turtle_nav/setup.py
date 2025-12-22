@@ -35,6 +35,8 @@ setup(
             'turtle_static_map = turtle_nav.turtle_static_map_node:main',
             'turtle_astar_planner = turtle_nav.turtle_astar_planner:main',
             'turtle_path_follower = turtle_nav.turtle_path_follower:main',
+            'dynamic_obstacle_publisher = turtle_nav.dynamic_obstacle_publisher:main',
+            'map_fusion_node = turtle_nav.map_fusion_node:main',
         ],
     },
 )

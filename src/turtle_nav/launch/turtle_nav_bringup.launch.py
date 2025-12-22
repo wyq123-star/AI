@@ -70,32 +70,25 @@ def generate_launch_description():
         )
     )
 
-    # =========================
-    # 启动顺序控制
-    # =========================
+    dynamic_obstacle_publisher_node = Node(
+        package='turtle_nav',
+        executable='dynamic_obstacle_publisher',
+        name='dynamic_obstacle_publisher',
+        output='screen'
+    )
 
-    # # A* 启动 → 启动 map_server
-    # start_map_after_astar = RegisterEventHandler(
-    #     OnProcessStart(
-    #         target_action=astar_node,
-    #         on_start=[map_server_launch]
-    #     )
-    # )
+    map_fusion_node = Node(
+        package='turtle_nav',
+        executable='map_fusion_node',
+        name='map_fusion_node',
+        output='screen'
+    )
 
-    # # map_server 启动 → 启动 follower
-    # start_follower_after_map = RegisterEventHandler(
-    #     OnProcessStart(
-    #         target_action=map_server_launch,
-    #         on_start=[follower_node]
-    #     )
-    # )
-
-    # =========================
-    # 添加到 LaunchDescription
-    # =========================
     ld.add_action(turtlesim_node)
     ld.add_action(turtle_tf_node)
     ld.add_action(astar_node)
     ld.add_action(map_server_launch)
     ld.add_action(follower_node)
+    ld.add_action(dynamic_obstacle_publisher_node)
+    # ld.add_action(map_fusion_node)
     return ld
