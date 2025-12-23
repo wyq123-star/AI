@@ -19,13 +19,13 @@ class AStarPlanner(Node):
         super().__init__('turtle_astar_planner')
 
         # =========================
-        # Parameters
+        # 参数
         # =========================
         self.declare_parameter('use_inflation', True)
-        self.declare_parameter('inflation_radius', 1.0)     # 膨胀影响范围（米）
-        self.declare_parameter('lethal_radius', 0.3)        # 致命半径（米）
-        self.declare_parameter('cost_scaling', 10.0)        # 膨胀代价强度
-        self.declare_parameter('cost_weight', 5.0)          # 代价权重
+        self.declare_parameter('inflation_radius', 1.0)
+        self.declare_parameter('lethal_radius', 0.3)
+        self.declare_parameter('cost_scaling', 10.0)
+        self.declare_parameter('cost_weight', 5.0)
         self.declare_parameter('allow_unknown', False)
 
         self.use_inflation = self.get_parameter('use_inflation').value
@@ -39,7 +39,7 @@ class AStarPlanner(Node):
         # ROS I/O
         # =========================
         self.map_sub = self.create_subscription(
-            OccupancyGrid, '/planning_map', self.map_callback, 10)
+            OccupancyGrid, '/map', self.map_callback, 10)
 
         goal_qos = QoSProfile(
             depth=1,
@@ -55,7 +55,7 @@ class AStarPlanner(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # =========================
-        # State
+        # 状态
         # =========================
         self.map = None
         self.costmap = None
@@ -66,17 +66,18 @@ class AStarPlanner(Node):
 
         self.pending_goal = None
         self.costmap_ready = False
+        self.path_planned = False  # 标记是否已经规划过路径
 
         # =========================
         # Timer
         # =========================
         self.timer = self.create_timer(0.1, self.try_plan)
 
-        self.get_logger().info('A* global planner with inflation started')
+        self.get_logger().info('A* global planner started (one-time planning)')
 
-    # =====================================================
+    # =========================
     # Map callback
-    # =====================================================
+    # =========================
     def map_callback(self, msg: OccupancyGrid):
         self.width = msg.info.width
         self.height = msg.info.height
@@ -90,22 +91,23 @@ class AStarPlanner(Node):
         if self.use_inflation:
             self.build_costmap()
             self.costmap_ready = True
-            self.get_logger().info('Costmap rebuilt')
+            self.get_logger().info('Static costmap built')
 
-    # =====================================================
+    # =========================
     # Goal callback
-    # =====================================================
+    # =========================
     def goal_callback(self, goal: PoseStamped):
         self.pending_goal = goal
+        self.path_planned = False  # 新目标，需要重新规划
         self.get_logger().info(
-            f'Goal cached: x={goal.pose.position.x:.2f}, y={goal.pose.position.y:.2f}'
+            f'New goal received: x={goal.pose.position.x:.2f}, y={goal.pose.position.y:.2f}'
         )
 
-    # =====================================================
+    # =========================
     # Timer planning
-    # =====================================================
+    # =========================
     def try_plan(self):
-        if self.pending_goal is None or self.map is None:
+        if self.pending_goal is None or self.map is None or self.path_planned:
             return
 
         start = self.get_robot_pose()
@@ -122,11 +124,14 @@ class AStarPlanner(Node):
                           self.costmap if self.costmap_ready else None)
         if path:
             self.publish_path(path)
-            self.get_logger().info(f'Path published ({len(path)} points)')
+            self.path_planned = True
+            self.get_logger().info(f'Global path published ({len(path)} points)')
+        else:
+            self.get_logger().warn('Failed to plan global path')
 
-    # =====================================================
+    # =========================
     # TF
-    # =====================================================
+    # =========================
     def get_robot_pose(self):
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -135,9 +140,9 @@ class AStarPlanner(Node):
         except Exception:
             return None
 
-    # =====================================================
-    # A*
-    # =====================================================
+    # =========================
+    # A* 核心算法（保持不变）
+    # =========================
     def astar(self, start, goal, costmap=None):
         open_set = []
         heapq.heappush(open_set, (0.0, start))
@@ -180,18 +185,14 @@ class AStarPlanner(Node):
                     results.append(((nx, ny), step))
         return results
 
-    # =====================================================
-    # Collision & cost
-    # =====================================================
     def is_free(self, idx):
         x, y = idx
 
         if self.map[y, x] == 100:
             return False
 
-        if self.costmap_ready:
-            if not np.isfinite(self.costmap[y, x]):
-                return False
+        if self.costmap_ready and not np.isfinite(self.costmap[y, x]):
+            return False
 
         if self.map[y, x] == -1:
             return self.allow_unknown
@@ -203,28 +204,25 @@ class AStarPlanner(Node):
             return 1.0
         return 1.0 + self.cost_weight * costmap[idx[1], idx[0]]
 
-    # =====================================================
-    # Costmap (Nav2-style inflation)
-    # =====================================================
+    # =========================
+    # Costmap (静态膨胀)
+    # =========================
     def build_costmap(self):
         obstacle_mask = (self.map == 100)
-
         dist = distance_transform_edt(~obstacle_mask) * self.resolution
         self.costmap = np.zeros_like(dist, dtype=np.float32)
 
         lethal_mask = dist < self.lethal_radius
         self.costmap[lethal_mask] = np.inf
 
-        inflation_mask = (dist >= self.lethal_radius) & \
-                         (dist <= self.inflation_radius)
-
+        inflation_mask = (dist >= self.lethal_radius) & (dist <= self.inflation_radius)
         self.costmap[inflation_mask] = self.cost_scaling * np.exp(
             -(dist[inflation_mask] - self.lethal_radius)
         )
 
-    # =====================================================
-    # Utils
-    # =====================================================
+    # =========================
+    # 工具函数
+    # =========================
     def world_to_grid(self, x, y):
         gx = int((x - self.origin.x) / self.resolution)
         gy = int((y - self.origin.y) / self.resolution)

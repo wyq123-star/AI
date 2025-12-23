@@ -84,11 +84,19 @@ def generate_launch_description():
         output='screen'
     )
 
+    obstacle_motion = Node(
+        package='turtle_nav',
+        executable='obstacle_motion',
+        name='obstacle_motion',
+        output='screen'
+    )
+
     ld.add_action(turtlesim_node)
     ld.add_action(turtle_tf_node)
     ld.add_action(astar_node)
     ld.add_action(map_server_launch)
     ld.add_action(follower_node)
     ld.add_action(dynamic_obstacle_publisher_node)
+    ld.add_action(obstacle_motion)
     # ld.add_action(map_fusion_node)
     return ld
