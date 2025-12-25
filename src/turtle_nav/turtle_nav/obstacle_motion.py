@@ -72,7 +72,7 @@ class ObstacleMotion(Node):
                 desired = math.atan2(dy, dx)
                 err = self.angle_diff(desired, pose.theta)
 
-                cmd.linear.x = 1.2
+                cmd.linear.x = 0.8
                 cmd.angular.z = 4.0 * err
 
             self.cmd_pubs[name].publish(cmd)

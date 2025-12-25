@@ -1,149 +1,176 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+import math
 
-from nav_msgs.msg import Path, OccupancyGrid
 from geometry_msgs.msg import Twist
 from turtlesim.msg import Pose
-
-import math
-import numpy as np
+from nav_msgs.msg import Path
 
 
-class DynamicLocalPlanner(Node):
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+class RegulatedPurePursuit(Node):
 
     def __init__(self):
-        super().__init__('dynamic_local_planner')
+        super().__init__('regulated_pure_pursuit')
 
         # ===============================
-        # 参数
+        # 参数（Nav2 风格）
         # ===============================
-        self.lookahead_dist = 1.2
-        self.linear_speed = 1.2
-        self.sim_time = 1.0
-        self.sim_dt = 0.1
+        self.lookahead_dist = 0.8
 
-        self.angular_samples = [-1.2, -0.9, -0.6, -0.3,
-                                0.0,
-                                0.3, 0.6, 0.9, 1.2]
+        self.max_linear = 2.0
+        self.max_angular = 2.0
+
+        self.k_yaw = 2.5
+
+        # 原地转向滞回
+        self.rotate_enter = 0.7   # 进入原地转
+        self.rotate_exit = 0.3    # 退出原地转
+
+        # 调速因子（Regulation）
+        self.min_speed_ratio = 0.2
+
+        self.goal_tolerance = 0.2
 
         # ===============================
         # 状态
         # ===============================
         self.robot_pose = None
         self.global_path = None
-        self.dynamic_map = None
+        self.target_idx = 0
+
+        self.rotate_in_place = False
 
         # ===============================
         # ROS IO
         # ===============================
         self.create_subscription(Pose, '/turtle1/pose', self.pose_cb, 10)
         self.create_subscription(Path, '/plan', self.path_cb, 10)
-        self.create_subscription(OccupancyGrid, '/dynamic_map', self.map_cb, 10)
 
         self.cmd_pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
 
         self.timer = self.create_timer(0.05, self.update)
 
-        self.get_logger().info('Dynamic Local Planner started')
+        self.get_logger().info('Regulated Pure Pursuit started')
 
-    # ======================================================
-    def pose_cb(self, msg):
+    # ===============================
+    # 回调
+    # ===============================
+    def pose_cb(self, msg: Pose):
         self.robot_pose = msg
 
-    def path_cb(self, msg):
+    def path_cb(self, msg: Path):
         self.global_path = msg.poses
+        self.target_idx = 0
+        self.rotate_in_place = False
+        self.get_logger().info(f'Received path with {len(self.global_path)} points')
 
-    def map_cb(self, msg):
-        self.dynamic_map = msg
-
-    # ======================================================
+    # ===============================
+    # 主循环
+    # ===============================
     def update(self):
-        if self.robot_pose is None or \
-           self.global_path is None or \
-           self.dynamic_map is None:
+        if self.robot_pose is None or not self.global_path:
             return
 
         target = self.select_lookahead()
         if target is None:
             return
 
-        best_cost = float('inf')
-        best_w = 0.0
+        # --- 计算目标方向 ---
+        dx = target.x - self.robot_pose.x
+        dy = target.y - self.robot_pose.y
+        target_yaw = math.atan2(dy, dx)
 
-        for w in self.angular_samples:
-            cost = self.simulate(self.linear_speed, w, target)
-            if cost < best_cost:
-                best_cost = cost
-                best_w = w
+        yaw_error = self.normalize_angle(
+            target_yaw - self.robot_pose.theta
+        )
 
-        cmd = Twist()
-        cmd.linear.x = self.linear_speed
-        cmd.angular.z = best_w
-        self.cmd_pub.publish(cmd)
+        # ===============================
+        # 原地转向（带滞回）
+        # ===============================
+        if self.rotate_in_place:
+            if abs(yaw_error) < self.rotate_exit:
+                self.rotate_in_place = False
+            else:
+                self.publish_cmd(0.0, self.k_yaw * yaw_error)
+                return
+        else:
+            if abs(yaw_error) > self.rotate_enter:
+                self.rotate_in_place = True
+                self.publish_cmd(0.0, self.k_yaw * yaw_error)
+                return
 
-    # ======================================================
-    # 从全局路径选一个局部目标
-    # ======================================================
+        # ===============================
+        # Regulated 前进控制
+        # ===============================
+        # 角速度
+        w = clamp(
+            self.k_yaw * yaw_error,
+            -self.max_angular,
+            self.max_angular
+        )
+
+        # 角度越大，线速度越小（Nav2 核心思想）
+        speed_ratio = max(
+            self.min_speed_ratio,
+            1.0 - abs(w) / self.max_angular
+        )
+
+        v = self.max_linear * speed_ratio
+
+        # 到终点
+        if self.is_goal_reached():
+            self.publish_cmd(0.0, 0.0)
+            self.global_path = None
+            self.get_logger().info('Goal reached')
+            return
+
+        self.publish_cmd(v, w)
+
+    # ===============================
+    # Lookahead 选择
+    # ===============================
     def select_lookahead(self):
         rx, ry = self.robot_pose.x, self.robot_pose.y
-        for p in self.global_path:
-            dx = p.pose.position.x - rx
-            dy = p.pose.position.y - ry
-            if math.hypot(dx, dy) > self.lookahead_dist:
-                return p.pose.position
-        return None
+        for i in range(self.target_idx, len(self.global_path)):
+            p = self.global_path[i].pose.position
+            if math.hypot(p.x - rx, p.y - ry) > self.lookahead_dist:
+                self.target_idx = i
+                return p
+        return self.global_path[-1].pose.position
 
-    # ======================================================
-    # 轨迹模拟 + 代价评估
-    # ======================================================
-    def simulate(self, v, w, target):
-        x = self.robot_pose.x
-        y = self.robot_pose.y
-        theta = self.robot_pose.theta
+    # ===============================
+    # Utils
+    # ===============================
+    def publish_cmd(self, v, w):
+        cmd = Twist()
+        cmd.linear.x = clamp(v, 0.0, self.max_linear)
+        cmd.angular.z = clamp(w, -self.max_angular, self.max_angular)
+        self.cmd_pub.publish(cmd)
 
-        cost = 0.0
-        t = 0.0
+    def is_goal_reached(self):
+        goal = self.global_path[-1].pose.position
+        return math.hypot(
+            goal.x - self.robot_pose.x,
+            goal.y - self.robot_pose.y
+        ) < self.goal_tolerance
 
-        while t < self.sim_time:
-            x += v * math.cos(theta) * self.sim_dt
-            y += v * math.sin(theta) * self.sim_dt
-            theta += w * self.sim_dt
-
-            cell = self.world_to_grid(x, y)
-            if cell is None:
-                return float('inf')
-
-            c = self.dynamic_map.data[cell]
-            if c >= 100:
-                return float('inf')
-
-            cost += c
-            t += self.sim_dt
-
-        # 距离路径目标的代价
-        dx = target.x - x
-        dy = target.y - y
-        cost += 10.0 * math.hypot(dx, dy)
-
-        return cost
-
-    # ======================================================
-    # 世界坐标 → 栅格索引
-    # ======================================================
-    def world_to_grid(self, x, y):
-        info = self.dynamic_map.info
-        gx = int((x - info.origin.position.x) / info.resolution)
-        gy = int((y - info.origin.position.y) / info.resolution)
-
-        if 0 <= gx < info.width and 0 <= gy < info.height:
-            return gy * info.width + gx
-        return None
+    @staticmethod
+    def normalize_angle(a):
+        while a > math.pi:
+            a -= 2 * math.pi
+        while a < -math.pi:
+            a += 2 * math.pi
+        return a
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DynamicLocalPlanner()
+    node = RegulatedPurePursuit()
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
