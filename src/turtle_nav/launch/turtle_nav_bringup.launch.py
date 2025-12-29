@@ -12,9 +12,6 @@ def generate_launch_description():
 
     ld = LaunchDescription()
 
-    # =========================
-    # turtlesim
-    # =========================
     turtlesim_node = Node(
         package='turtlesim',
         executable='turtlesim_node',
@@ -22,9 +19,6 @@ def generate_launch_description():
         output='screen'
     )
 
-    # =========================
-    # TF
-    # =========================
     turtle_tf_node = Node(
         package='turtle_nav',
         executable='turtle_tf',
@@ -32,9 +26,6 @@ def generate_launch_description():
         output='screen'
     )
 
-    # =========================
-    # A*
-    # =========================
     astar_node = Node(
         package='turtle_nav',
         executable='turtle_astar_planner',
@@ -47,9 +38,6 @@ def generate_launch_description():
     )
 
 
-    # =========================
-    # follower
-    # =========================
     follower_node = Node(
         package='turtle_nav',
         executable='turtle_path_follower',
@@ -57,9 +45,6 @@ def generate_launch_description():
         output='screen'
     )
 
-    # =========================
-    # map_server launch
-    # =========================
     map_server_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(
@@ -91,6 +76,13 @@ def generate_launch_description():
         output='screen'
     )
 
+    local_panner_dynamic_node = Node(
+        package='turtle_nav',
+        executable='local_planner_dynamic',
+        name='local_planner_dynamic',
+        output='screen'
+    )
+
     ld.add_action(turtlesim_node)
     ld.add_action(turtle_tf_node)
     ld.add_action(astar_node)
@@ -99,4 +91,6 @@ def generate_launch_description():
     ld.add_action(dynamic_obstacle_publisher_node)
     ld.add_action(obstacle_motion)
     # ld.add_action(map_fusion_node)
+    ld.add_action(local_panner_dynamic_node)
+    
     return ld
